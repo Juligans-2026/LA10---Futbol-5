@@ -1,4 +1,4 @@
-<title>LA10 Cancha</title>
+<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>body{margin:0}</style></head><body><title>LA10 Cancha</title>
 <link rel="manifest" href="manifest.json">
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
@@ -308,6 +308,21 @@
   main > section > .view-head .btn-ghost, main > section > .period-bar .btn-ghost, main > section > .period-bar .icon-btn, main > section > .toolbar .btn-ghost{ background:var(--surface); }
   main .totals-box{ background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:14px 18px; margin-top:12px; }
   @media (prefers-reduced-motion: reduce){ *{transition:none !important;} }
+
+  /* ---------- Estado de almacenamiento ---------- */
+  .sync-pill{display:inline-flex; align-items:center; gap:6px; align-self:flex-start; margin-top:4px; font-size:.68rem; font-weight:600; padding:2px 9px 2px 7px; border-radius:99px; background:#fff; color:#33413a; border:1px solid rgba(0,0,0,.12); cursor:pointer; white-space:nowrap; user-select:none;}
+  .sync-pill .dot{width:8px; height:8px; border-radius:50%; background:#9aa39e;}
+  .sync-pill.shared .dot{background:#1fa04a; box-shadow:0 0 0 3px rgba(31,160,74,.2);}
+  .sync-pill.local{background:#FFF3D6; color:#7a4b00; border-color:#F0C970;}
+  .sync-pill.local .dot{background:#E39B00;}
+  .sync-pill.offline{background:#FDE7E4; color:#8a1c12; border-color:#F2B1AA;}
+  .sync-pill.offline .dot{background:#D93025;}
+  .sync-pill.connecting .dot{background:#9aa39e; animation:syncblink 1s infinite;}
+  @keyframes syncblink{50%{opacity:.25}}
+  .sync-banner{background:#FFF3D6; color:#5c3a00; border:1px solid #F0C970; border-radius:12px; padding:12px 16px; margin-block:6px 10px; font-size:.86rem; line-height:1.45;}
+  .sync-banner p{margin:0 0 10px;}
+  .sync-actions{display:flex; flex-wrap:wrap; gap:8px;}
+  .sync-actions .btn{background:#fff; color:#33413a; border:1px solid #E0C27A;}
 </style>
 
 <header class="topbar wrap">
@@ -316,6 +331,7 @@
     <div class="brand-text">
       <span class="brand-name">LA10</span>
       <span class="brand-tag">Cancha Sintética · Fútbol 5</span>
+      <span class="sync-pill connecting" id="sync-pill" hidden role="button" tabindex="0" title="Estado del almacenamiento"><span class="dot"></span>Conectando…</span>
     </div>
   </div>
   <nav class="tabs" id="tabs">
@@ -332,6 +348,15 @@
     <button data-view="ajustes">Ajustes</button>
   </nav>
 </header>
+<div class="sync-banner wrap" id="sync-banner" hidden>
+  <p id="sync-msg"></p>
+  <div class="sync-actions">
+    <button type="button" class="btn small" id="sync-backup">Descargar copia de seguridad</button>
+    <button type="button" class="btn small" id="sync-restore">Restaurar copia</button>
+    <button type="button" class="btn small" id="sync-retry">Reintentar conexión</button>
+    <input type="file" id="sync-file" accept="application/json,.json" hidden>
+  </div>
+</div>
 
 <main class="wrap">
 
@@ -1155,6 +1180,7 @@
     wireReports();
     wireRecompra();
     wireExports();
+    wireSyncUi();
     wireReservas();
     wireBookingForm();
     wireChargeForm();
@@ -1165,21 +1191,194 @@
     initDb();
   });
 
-  function initDb(){
-    if(!window.claude || !window.claude.use){ renderAll(); return; }
-    window.claude.use('db').then(function(db){
-      if(!db){ toast('Este visor no tiene almacenamiento disponible en este momento.'); return; }
-      state.db = db;
-      subscribe('products', db.collection('products').orderBy('name'));
-      subscribe('customers', db.collection('customers').orderBy('name'));
-      subscribe('sales', db.collection('sales').orderBy('createdAt','desc').limit(SALES_LIMIT), function(s){ state.rep.dirty = true; return normSale(s); });
-      subscribe('pending', db.collection('sales').where('balance','>',0), normSale);
-      subscribe('payments', db.collection('payments').orderBy('createdAt','desc').limit(PAY_LIMIT), function(p){ state.rep.dirty = true; return p; });
-      subscribe('movements', db.collection('stock_movements').orderBy('createdAt','desc').limit(200));
+  /* =========================================================
+     ALMACENAMIENTO: base compartida de Claude, o modo local si no está disponible
+  ========================================================= */
+  var APP_KEY = 'la10';
+  var ALL_COLLECTIONS = ['products','customers','sales','payments','stock_movements','bookings','promos','settings'];
+
+  function createLocalDb(key){
+    var store = {}, listeners = {}, timer = null, warned = false;
+    function load(){ try{ var raw = localStorage.getItem(key); store = raw ? JSON.parse(raw) : {}; }catch(e){ store = {}; } }
+    function save(){
+      clearTimeout(timer);
+      timer = setTimeout(function(){
+        try{ localStorage.setItem(key, JSON.stringify(store)); }
+        catch(e){ if(!warned){ warned = true; toast('El navegador no puede guardar más datos. Descarga una copia de seguridad.'); } }
+      }, 120);
+    }
+    function col(p){ return store[p] || (store[p] = {}); }
+    function clone(o){ return JSON.parse(JSON.stringify(o)); }
+    function newId(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,8); }
+    function run(q){
+      var c = col(q.path);
+      var docs = Object.keys(c).map(function(id){ return {id:id, _d:c[id], data:function(){ return clone(c[id]); }}; });
+      q.filters.forEach(function(f){
+        docs = docs.filter(function(d){
+          var v = d._d[f[0]], x = f[2];
+          switch(f[1]){
+            case '==': return v===x;   case '!=': return v!==x;
+            case '<':  return v!=null && v<x;   case '<=': return v!=null && v<=x;
+            case '>':  return v!=null && v>x;   case '>=': return v!=null && v>=x;
+            case 'in': return (x||[]).indexOf(v)>-1;   case 'not-in': return (x||[]).indexOf(v)<0;
+            case 'array-contains': return Array.isArray(v) && v.indexOf(x)>-1;
+          }
+          return true;
+        });
+      });
+      if(q.order){
+        var f = q.order[0], dir = q.order[1]==='desc' ? -1 : 1;
+        docs.sort(function(a,b){
+          var x = a._d[f], y = b._d[f];
+          if(x===y) return a.id<b.id ? -1 : 1;
+          if(x===undefined) return 1; if(y===undefined) return -1;
+          return (x<y ? -1 : 1)*dir;
+        });
+      } else docs.sort(function(a,b){ return a.id<b.id ? -1 : 1; });
+      if(q.lim) docs = docs.slice(0, q.lim);
+      return {docs:docs, size:docs.length};
+    }
+    function notify(path){ (listeners[path]||[]).slice().forEach(function(l){ try{ l.next(run(l.q)); }catch(e){ console.error(e); } }); }
+    function notifyAll(){ Object.keys(listeners).forEach(notify); }
+    function mkQuery(path, filters, order, lim){
+      var q = {path:path, filters:filters||[], order:order||null, lim:lim||0};
+      q.where = function(f,op,v){ return mkQuery(path, q.filters.concat([[f,op,v]]), q.order, q.lim); };
+      q.orderBy = function(f,d){ return mkQuery(path, q.filters, [f,d||'asc'], q.lim); };
+      q.limit = function(n){ return mkQuery(path, q.filters, q.order, n); };
+      q.get = function(){ return Promise.resolve(run(q)); };
+      q.onSnapshot = function(next){
+        var l = {q:q, next:next};
+        (listeners[path] = listeners[path] || []).push(l);
+        setTimeout(function(){ next(run(q)); }, 0);
+        return function(){ listeners[path] = (listeners[path]||[]).filter(function(x){ return x!==l; }); };
+      };
+      return q;
+    }
+    load();
+    window.addEventListener('storage', function(e){ if(e.key===key){ load(); notifyAll(); } });   // otra pestaña guardó algo
+    return {
+      isLocal: true,
+      collection: function(path){
+        var q = mkQuery(path);
+        q.add = function(data){ var id = newId(); col(path)[id] = clone(data); save(); notify(path); return Promise.resolve({id:id}); };
+        q.doc = function(id){ return {
+          id:id,
+          get: function(){ var d = col(path)[id]; return Promise.resolve({exists:!!d, id:id, data:function(){ return d ? clone(d) : undefined; }}); },
+          set: function(d){ col(path)[id] = clone(d); save(); notify(path); return Promise.resolve(); },
+          update: function(d){
+            if(!col(path)[id]) return Promise.reject({code:'invalid_argument', message:'not found'});
+            Object.assign(col(path)[id], clone(d)); save(); notify(path); return Promise.resolve();
+          },
+          delete: function(){ delete col(path)[id]; save(); notify(path); return Promise.resolve(); }
+        }; };
+        return q;
+      }
+    };
+  }
+
+  /* ---------- aviso de estado, copia de seguridad y restauración ---------- */
+  function setSyncStatus(mode, reason){
+    state.mode = mode;
+    var pill = document.getElementById('sync-pill'), banner = document.getElementById('sync-banner'), msg = document.getElementById('sync-msg');
+    if(!pill) return;
+    pill.hidden = false;
+    pill.className = 'sync-pill ' + mode;
+    var label = { connecting:'Conectando…', shared:'En línea · compartido', local:'Modo local', offline:'Sin internet' }[mode] || '';
+    pill.innerHTML = '<span class="dot"></span>' + label;
+    if(mode==='local'){
+      msg.innerHTML = (reason==='none'
+        ? 'Estás usando una copia de la app fuera de Claude (o con un enlace/app instalada que no tiene acceso a la base compartida).'
+        : 'La base compartida de Claude no está disponible en esta pantalla (por ejemplo, la app instalada o el enlace abierto en una pestaña aparte).') +
+        ' Los datos se guardan <b>solo en este navegador</b> y no se comparten con otras personas. Para trabajar en equipo y en tiempo real, abre el enlace desde claude.ai con tu sesión iniciada. Haz copias de seguridad con frecuencia.';
+      banner.hidden = false;
+    } else if(mode==='shared'){
+      banner.hidden = true;
+    }
+  }
+
+  function failToast(err, fallback){
+    var code = err && err.code;
+    if(code==='invalid_argument') toast('No tienes permiso para guardar: pide acceso de Colaborador o Editor en “Compartir”.');
+    else if(code==='quota_exceeded' || code==='resource_exhausted') toast('La base de datos llegó a su límite. Descarga una copia en Excel y libera registros.');
+    else if(code==='unavailable' || code==='revoked' || code==='not_granted' || code==='capability_disabled' || code==='capability_removed') toast('Sin conexión con el almacenamiento. Revisa tu internet e inténtalo de nuevo.');
+    else toast(fallback);
+  }
+
+  function downloadBlob(filename, blob){
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = filename;
+    document.body.appendChild(a); a.click();
+    setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 1500);
+  }
+
+  function backupNow(){
+    if(!state.db){ toast('Aún conectando con el almacenamiento.'); return; }
+    var out = { app:APP_KEY, version:1, exportedAt:new Date().toISOString(), data:{} };
+    Promise.all(ALL_COLLECTIONS.map(function(c){
+      return state.db.collection(c).limit(1000).get().then(function(snap){
+        out.data[c] = {}; snap.docs.forEach(function(d){ out.data[c][d.id] = d.data(); });
+      });
+    })).then(function(){
+      downloadBlob(APP_KEY+'_copia_'+todayISO()+'.json', new Blob([JSON.stringify(out)], {type:'application/json'}));
+      toast('Copia de seguridad descargada.');
+    }).catch(function(err){ failToast(err, 'No se pudo crear la copia de seguridad.'); });
+  }
+
+  function restoreFrom(file){
+    var fr = new FileReader();
+    fr.onload = function(){
+      var obj;
+      try{ obj = JSON.parse(fr.result); }catch(e){ toast('El archivo no es una copia de seguridad válida.'); return; }
+      if(!obj || !obj.data){ toast('El archivo no es una copia de seguridad válida.'); return; }
+      var writes = [];
+      Object.keys(obj.data).forEach(function(c){
+        if(ALL_COLLECTIONS.indexOf(c)<0) return;
+        Object.keys(obj.data[c]).forEach(function(id){ writes.push([c,id,obj.data[c][id]]); });
+      });
+      if(!writes.length){ toast('La copia no tiene datos.'); return; }
+      if(!confirm('Se restaurarán '+writes.length+' registros (los que ya existan con el mismo código se reemplazan). ¿Continuar?')) return;
+      var n = 0;
+      writes.reduce(function(chain, w){
+        return chain.then(function(){ return state.db.collection(w[0]).doc(w[1]).set(w[2]); }).then(function(){ n++; if(n%100===0) toast('Restaurando… '+n+' de '+writes.length); });
+      }, Promise.resolve()).then(function(){ toast('Copia restaurada: '+n+' registros.'); })
+        .catch(function(err){ failToast(err, 'No se pudo restaurar la copia completa.'); });
+    };
+    fr.readAsText(file);
+  }
+
+  function wireSyncUi(){
+    var pill = document.getElementById('sync-pill'), banner = document.getElementById('sync-banner');
+    pill.addEventListener('click', function(){ banner.hidden = !banner.hidden; if(state.mode==='shared' && !banner.hidden) document.getElementById('sync-msg').textContent = 'Base compartida activa: lo que registres lo ven en tiempo real las demás personas con acceso. Aquí puedes descargar o restaurar una copia de seguridad.'; });
+    document.getElementById('sync-backup').addEventListener('click', backupNow);
+    document.getElementById('sync-restore').addEventListener('click', function(){ document.getElementById('sync-file').click(); });
+    document.getElementById('sync-file').addEventListener('change', function(){ if(this.files[0]) restoreFrom(this.files[0]); this.value = ''; });
+    document.getElementById('sync-retry').addEventListener('click', function(){ location.reload(); });
+    window.addEventListener('offline', function(){ if(state.mode==='shared') setSyncStatus('offline'); });
+    window.addEventListener('online', function(){ if(state.mode==='offline') setSyncStatus('shared'); });
+  }
+
+  function startStores(db){
+    state.db = db;
+    subscribe('products', db.collection('products').orderBy('name'));
+    subscribe('customers', db.collection('customers').orderBy('name'));
+    subscribe('sales', db.collection('sales').orderBy('createdAt','desc').limit(SALES_LIMIT), function(s){ state.rep.dirty = true; return normSale(s); });
+    subscribe('pending', db.collection('sales').where('balance','>',0), normSale);
+    subscribe('payments', db.collection('payments').orderBy('createdAt','desc').limit(PAY_LIMIT), function(p){ state.rep.dirty = true; return p; });
+    subscribe('movements', db.collection('stock_movements').orderBy('createdAt','desc').limit(200));
       subscribe('bookings', db.collection('bookings').where('dateISO','>=', addDays(todayISO(),-60)).orderBy('dateISO','desc').limit(1000));
       subscribe('promos', db.collection('promos').orderBy('createdAt','desc'));
       subscribe('settingsDocs', db.collection('settings'));
-    }).catch(function(){ toast('No se pudo conectar el almacenamiento.'); });
+  }
+
+  function initDb(){
+    setSyncStatus('connecting');
+    var settled = false, timer = null;
+    function startLocal(reason){ if(settled) return; settled = true; clearTimeout(timer); startStores(createLocalDb(APP_KEY)); setSyncStatus('local', reason); }
+    function startShared(db){ if(settled) return; settled = true; clearTimeout(timer); startStores(db); setSyncStatus(navigator.onLine===false ? 'offline' : 'shared'); }
+    if(!window.claude || !window.claude.use){ startLocal('none'); return; }
+    timer = setTimeout(function(){ startLocal('null'); }, 12000);
+    window.claude.use('db').then(function(db){ if(db) startShared(db); else startLocal('null'); })
+      .catch(function(){ startLocal('null'); });
   }
 
   function subscribe(key, query, mapFn){
@@ -1488,8 +1687,8 @@
     var p = state.products.find(function(x){ return x.id===id; });
     if(!p) return;
     if(!confirm('¿Eliminar "'+p.name+'" del catálogo? Esta acción no se puede deshacer.')) return;
-    if(!state.db){ toast('Sin conexión al almacenamiento.'); return; }
-    state.db.collection('products').doc(id).delete().then(function(){ toast('Producto eliminado.'); }).catch(function(){ toast('No se pudo eliminar.'); });
+    if(!state.db){ toast('Aún conectando con el almacenamiento, inténtalo de nuevo en unos segundos.'); return; }
+    state.db.collection('products').doc(id).delete().then(function(){ toast('Producto eliminado.'); }).catch(function(err){ failToast(err, 'No se pudo eliminar.'); });
   };
 
   function updateMarginPreview(){
@@ -1510,7 +1709,7 @@
 
     document.getElementById('form-product').addEventListener('submit', function(e){
       e.preventDefault();
-      if(!state.db){ toast('Sin conexión al almacenamiento.'); return; }
+      if(!state.db){ toast('Aún conectando con el almacenamiento, inténtalo de nuevo en unos segundos.'); return; }
       var id = document.getElementById('pm-id').value;
       var cat = document.getElementById('pm-category').value;
       if(cat==='Otro') cat = document.getElementById('pm-category-other').value.trim() || 'Otro';
@@ -1528,11 +1727,11 @@
       if(!data.name){ toast('El nombre es obligatorio.'); return; }
       var col = state.db.collection('products');
       if(id){
-        col.doc(id).update(data).then(function(){ toast('Producto actualizado.'); closeModal('modal-product'); }).catch(function(){ toast('No se pudo guardar.'); });
+        col.doc(id).update(data).then(function(){ toast('Producto actualizado.'); closeModal('modal-product'); }).catch(function(err){ failToast(err, 'No se pudo guardar.'); });
       } else {
         data.stock = Number(document.getElementById('pm-stock').value)||0;
         data.createdAt = Date.now();
-        col.add(data).then(function(){ toast('Producto creado.'); closeModal('modal-product'); }).catch(function(){ toast('No se pudo guardar.'); });
+        col.add(data).then(function(){ toast('Producto creado.'); closeModal('modal-product'); }).catch(function(err){ failToast(err, 'No se pudo guardar.'); });
       }
     });
   }
@@ -1607,7 +1806,7 @@
     document.getElementById('adj-qty').addEventListener('input', updateAdjustPreview);
     document.getElementById('form-adjust').addEventListener('submit', function(e){
       e.preventDefault();
-      if(!state.db){ toast('Sin conexión al almacenamiento.'); return; }
+      if(!state.db){ toast('Aún conectando con el almacenamiento, inténtalo de nuevo en unos segundos.'); return; }
       var id = document.getElementById('adj-id').value;
       var p = state.products.find(function(x){ return x.id===id; }); if(!p) return;
       var qty = Number(document.getElementById('adj-qty').value)||0;
@@ -1621,7 +1820,7 @@
           dateISO: todayISO(), createdAt: Date.now()
         });
       }).then(function(){ toast('Movimiento registrado.'); closeModal('modal-adjust'); })
-        .catch(function(){ toast('No se pudo registrar el movimiento.'); });
+        .catch(function(err){ failToast(err, 'No se pudo registrar el movimiento.'); });
     });
   }
 
@@ -1688,13 +1887,13 @@
     var msg = '¿Eliminar a "'+c.name+'" de tus clientes?' + (bal>0 ? '\n\nOJO: tiene un saldo pendiente de '+money(bal)+'. Sus ventas quedarán registradas, pero ya no podrás registrarle abonos desde Clientes.' : '');
     if(!confirm(msg)) return;
     if(!state.db) return;
-    state.db.collection('customers').doc(id).delete().then(function(){ toast('Cliente eliminado.'); }).catch(function(){ toast('No se pudo eliminar.'); });
+    state.db.collection('customers').doc(id).delete().then(function(){ toast('Cliente eliminado.'); }).catch(function(err){ failToast(err, 'No se pudo eliminar.'); });
   };
 
   function wireCustomerForm(){
     document.getElementById('form-customer').addEventListener('submit', function(e){
       e.preventDefault();
-      if(!state.db){ toast('Sin conexión al almacenamiento.'); return; }
+      if(!state.db){ toast('Aún conectando con el almacenamiento, inténtalo de nuevo en unos segundos.'); return; }
       var id = document.getElementById('cm-id').value;
       var data = {
         name: document.getElementById('cm-name').value.trim(),
@@ -1706,10 +1905,10 @@
       if(!data.name){ toast('El nombre es obligatorio.'); return; }
       var col = state.db.collection('customers');
       if(id){
-        col.doc(id).update(data).then(function(){ toast('Cliente actualizado.'); closeModal('modal-customer'); }).catch(function(){ toast('No se pudo guardar.'); });
+        col.doc(id).update(data).then(function(){ toast('Cliente actualizado.'); closeModal('modal-customer'); }).catch(function(err){ failToast(err, 'No se pudo guardar.'); });
       } else {
         data.createdAt = Date.now();
-        col.add(data).then(function(){ toast('Cliente creado.'); closeModal('modal-customer'); }).catch(function(){ toast('No se pudo guardar.'); });
+        col.add(data).then(function(){ toast('Cliente creado.'); closeModal('modal-customer'); }).catch(function(err){ failToast(err, 'No se pudo guardar.'); });
       }
     });
   }
@@ -1780,7 +1979,7 @@
     document.getElementById('pay-amount').addEventListener('input', updatePaymentPreview);
     document.getElementById('form-payment').addEventListener('submit', function(e){
       e.preventDefault();
-      if(!state.db){ toast('Sin conexión al almacenamiento.'); return; }
+      if(!state.db){ toast('Aún conectando con el almacenamiento, inténtalo de nuevo en unos segundos.'); return; }
       var cid = document.getElementById('pay-cid').value;
       var c = state.customers.find(function(x){ return x.id===cid; }); if(!c) return;
       var amount = Math.round(Number(document.getElementById('pay-amount').value)||0);
@@ -1804,7 +2003,7 @@
       }).then(function(){
         toast('Abono de '+money(amount)+' registrado.');
         closeModal('modal-payment');
-      }).catch(function(){ toast('No se pudo registrar el abono. Revisa el saldo e inténtalo de nuevo.'); })
+      }).catch(function(err){ failToast(err, 'No se pudo registrar el abono. Revisa el saldo e inténtalo de nuevo.'); })
         .then(function(){ btn.disabled = false; });
     });
   }
@@ -1927,7 +2126,7 @@
 
   function submitSale(e){
     e.preventDefault();
-    if(!state.db){ toast('Sin conexión al almacenamiento.'); return; }
+    if(!state.db){ toast('Aún conectando con el almacenamiento, inténtalo de nuevo en unos segundos.'); return; }
     var rows = document.querySelectorAll('#sm-lines .sale-line');
     var items = [];
     rows.forEach(function(row){
@@ -1986,7 +2185,7 @@
       closeModal('modal-sale');
       state.viewDate = sale.dateISO;
       document.getElementById('ventas-date').value = sale.dateISO;
-    }).catch(function(){ toast('No se pudo registrar la venta.'); })
+    }).catch(function(err){ failToast(err, 'No se pudo registrar la venta.'); })
       .then(function(){ btn.disabled = false; });
   }
 
@@ -2007,7 +2206,7 @@
     }, Promise.resolve()).then(function(){ return state.db.collection('sales').doc(id).delete(); })
       .then(function(){ return s.bookingId ? state.db.collection('bookings').doc(s.bookingId).update({status:'reservada', saleId:null}) : null; })
       .then(function(){ toast(s.bookingId ? 'Cobro anulado: la reserva volvió a “reservada”.' : 'Venta anulada y stock repuesto.'); })
-      .catch(function(){ toast('No se pudo anular la venta.'); });
+      .catch(function(err){ failToast(err, 'No se pudo anular la venta.'); });
   };
 
   function saleStatusBadge(s){
@@ -2458,9 +2657,10 @@
   }
 
   function saveFile(filename, blob){
-    if(!window.claude || !window.claude.use) return Promise.reject({code:'unavailable'});
+    function direct(){ downloadBlob(filename, blob); return Promise.resolve(); }
+    if(!window.claude || !window.claude.use) return direct();
     return window.claude.use('downloads').then(function(dl){
-      if(!dl) throw {code:'unavailable'};
+      if(!dl) return direct();
       return dl.save({filename:filename, data:blob});
     });
   }
@@ -2531,7 +2731,7 @@
     document.getElementById('calc1-apply').addEventListener('click', function(){
       var pid = document.getElementById('calc-product').value; if(!pid || !state.db) return;
       var price = Number(document.getElementById('calc1-price').dataset.raw)||0;
-      state.db.collection('products').doc(pid).update({price: price}).then(function(){ toast('Precio actualizado en el producto.'); }).catch(function(){ toast('No se pudo actualizar.'); });
+      state.db.collection('products').doc(pid).update({price: price}).then(function(){ toast('Precio actualizado en el producto.'); }).catch(function(err){ failToast(err, 'No se pudo actualizar.'); });
     });
     updateCalc1(); updateCalc2();
   }
@@ -2759,7 +2959,7 @@
     $('form-settings').addEventListener('input', function(){ ajustesDirty = true; updateSettingsPreview(); });
     $('form-settings').addEventListener('submit', function(e){
       e.preventDefault();
-      if(!state.db){ toast('Sin conexión al almacenamiento.'); return; }
+      if(!state.db){ toast('Aún conectando con el almacenamiento, inténtalo de nuevo en unos segundos.'); return; }
       var data = {
         courtName: $('st-name').value.trim() || DEFAULTS.courtName,
         openHour: Number($('st-open').value), closeHour: Number($('st-close').value),
@@ -2773,7 +2973,7 @@
       if(data.peakEnd<=data.peakStart){ toast('El fin de la hora pico debe ser mayor que su inicio.'); return; }
       state.db.collection('settings').doc('cancha').set(data).then(function(){
         ajustesDirty = false; toast('Ajustes guardados.');
-      }).catch(function(){ toast('No se pudieron guardar los ajustes.'); });
+      }).catch(function(err){ failToast(err, 'No se pudieron guardar los ajustes.'); });
     });
   }
 
@@ -2895,14 +3095,14 @@
     if(!confirm('¿Cancelar la reserva de '+(b.customerName||'este cliente')+' del '+fmtDate(b.dateISO)+' a las '+hh(b.hour)+'? El horario quedará libre.')) return;
     state.db.collection('bookings').doc(id).update({status:'cancelada', cancelledAt:Date.now()})
       .then(function(){ toast('Reserva cancelada. El horario quedó libre.'); closeModal('modal-booking'); })
-      .catch(function(){ toast('No se pudo cancelar.'); });
+      .catch(function(err){ failToast(err, 'No se pudo cancelar.'); });
   }
 
   /* ---------- modal de reserva ---------- */
   var bkEditing = null, bkEditingPromo = null;
 
   function openBookingModal(opts){
-    if(!state.db){ toast('Sin conexión al almacenamiento.'); return; }
+    if(!state.db){ toast('Aún conectando con el almacenamiento, inténtalo de nuevo en unos segundos.'); return; }
     var b = opts.id ? state.bookings.find(function(x){ return x.id===opts.id; }) : null;
     bkEditing = b ? b.id : null;
     bkEditingPromo = (b && b.promoId) ? { id:b.promoId, name:b.promoName, type:b.promoType, value:b.promoValue, active:true,
@@ -3041,7 +3241,7 @@
 
   function submitBooking(e){
     e.preventDefault();
-    if(!state.db){ toast('Sin conexión al almacenamiento.'); return; }
+    if(!state.db){ toast('Aún conectando con el almacenamiento, inténtalo de nuevo en unos segundos.'); return; }
     var K = updateBookingPreview();
     if(!K.iso){ toast('Elige la fecha.'); return; }
     if(K.over){ toast('Ese turno pasa del horario de cierre.'); return; }
@@ -3089,7 +3289,7 @@
       state.res.date = K.iso; if(state.currentView!=='reservas') showView('reservas'); else renderReservas();
     }).catch(function(err){
       if(err && err.slotTaken){ toast('Alguien acaba de tomar ese horario. Elige otro.'); updateBookingPreview(); }
-      else toast('No se pudo guardar la reserva.');
+      else failToast(err, 'No se pudo guardar la reserva.');
     }).then(function(){ btn.disabled = false; });
   }
 
@@ -3133,7 +3333,7 @@
     $('ch-fiado').addEventListener('change', function(){ $('ch-method-wrap').style.display = this.checked ? 'none' : 'block'; });
     $('form-charge').addEventListener('submit', function(e){
       e.preventDefault();
-      if(!state.db){ toast('Sin conexión al almacenamiento.'); return; }
+      if(!state.db){ toast('Aún conectando con el almacenamiento, inténtalo de nuevo en unos segundos.'); return; }
       var b = state.bookings.find(function(x){ return x.id===chargingId; }); if(!b) return;
       if(b.status==='cobrada'){ toast('Esta reserva ya fue cobrada.'); closeModal('modal-charge'); return; }
       var fiado = $('ch-fiado').checked && !!b.customerId;
@@ -3164,7 +3364,7 @@
       }).then(function(){
         toast(fiado ? 'Reserva cobrada a crédito. Saldo: '+money(total) : 'Reserva cobrada: '+money(total));
         closeModal('modal-charge');
-      }).catch(function(){ toast('No se pudo registrar el cobro.'); })
+      }).catch(function(err){ failToast(err, 'No se pudo registrar el cobro.'); })
         .then(function(){ btn.disabled = false; });
     });
   }
@@ -3180,7 +3380,7 @@
     $('pr-delete').addEventListener('click', function(){
       var id = $('pr-id').value; if(!id) return;
       if(!confirm('¿Eliminar esta promoción? Las reservas que ya la usaron conservan su descuento.')) return;
-      state.db.collection('promos').doc(id).delete().then(function(){ toast('Promoción eliminada.'); closeModal('modal-promo'); }).catch(function(){ toast('No se pudo eliminar.'); });
+      state.db.collection('promos').doc(id).delete().then(function(){ toast('Promoción eliminada.'); closeModal('modal-promo'); }).catch(function(err){ failToast(err, 'No se pudo eliminar.'); });
     });
     $('view-promos').addEventListener('click', function(e){
       var b = e.target.closest('[data-pact]'); if(!b) return;
@@ -3214,7 +3414,7 @@
   }
 
   function openPromoModal(o){
-    if(!state.db){ toast('Sin conexión al almacenamiento.'); return; }
+    if(!state.db){ toast('Aún conectando con el almacenamiento, inténtalo de nuevo en unos segundos.'); return; }
     var p = o.id ? state.promos.find(function(x){ return x.id===o.id; }) : null;
     var c = cfg();
     var v = p || { name:o.name||'', type:o.type||'descuento_pct', value: (o.type==='tiempo_extra'?15:(o.type==='descuento_monto'?10000:20)), days:o.days||[], hourFrom: o.hourFrom!=null?o.hourFrom:c.openHour, hourTo:o.hourTo!=null?o.hourTo:c.closeHour,
@@ -3243,7 +3443,7 @@
 
   function submitPromo(e){
     e.preventDefault();
-    if(!state.db){ toast('Sin conexión al almacenamiento.'); return; }
+    if(!state.db){ toast('Aún conectando con el almacenamiento, inténtalo de nuevo en unos segundos.'); return; }
     var id = $('pr-id').value, type = $('pr-type').value;
     var days = []; document.querySelectorAll('.pr-day').forEach(function(cb){ if(cb.checked) days.push(Number(cb.value)); });
     if(!days.length){ toast('Elige al menos un día.'); return; }
@@ -3267,7 +3467,7 @@
     }
     var col = state.db.collection('promos');
     var job = id ? col.doc(id).update(data) : col.add(Object.assign(data, {createdAt:Date.now()}));
-    job.then(function(){ toast('Promoción guardada.'); closeModal('modal-promo'); }).catch(function(){ toast('No se pudo guardar la promoción.'); });
+    job.then(function(){ toast('Promoción guardada.'); closeModal('modal-promo'); }).catch(function(err){ failToast(err, 'No se pudo guardar la promoción.'); });
   }
 
   function renderPromos(){
@@ -3389,3 +3589,4 @@
 
 })();
 </script>
+</body></html>
